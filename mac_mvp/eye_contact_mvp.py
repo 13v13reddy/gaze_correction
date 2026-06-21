@@ -1,16 +1,10 @@
 """macOS eye-contact MVP prototype.
 
-This is a lightweight proof of concept for simulating eye contact on macOS.
-It supports both MediaPipe APIs:
-
-1. Older `mediapipe.solutions.face_mesh` API.
-2. Newer Python 3.12 `mediapipe.tasks` FaceLandmarker API.
+Lightweight proof of concept for simulating eye contact on macOS.
+Supports both the old MediaPipe solutions API and the newer MediaPipe Tasks API.
 
 Run:
-    python mac_mvp/eye_contact_mvp.py --debug
-
-If your MediaPipe package only exposes `tasks`, download the model first:
-    python mac_mvp/download_models.py
+    python mac_mvp/eye_contact_mvp.py --debug --strength 0.8
 
 Keys:
     q or Esc  quit
@@ -33,7 +27,7 @@ import numpy as np
 
 try:
     import pyvirtualcam
-except ImportError:  # optional dependency
+except ImportError:
     pyvirtualcam = None
 
 try:
@@ -42,7 +36,6 @@ try:
 except ImportError:
     mp_tasks_python = None
     mp_tasks_vision = None
-
 
 LEFT_EYE_OUTLINE = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
 RIGHT_EYE_OUTLINE = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
@@ -78,7 +71,7 @@ def _points_from_landmarks(landmarks, indices: Iterable[int], width: int, height
     return np.asarray(points, dtype=np.int32)
 
 
-def _bounding_box(points: np.ndarray, width: int, height: int, pad_ratio: float = 0.55) -> EyeBox:
+def _bounding_box(points: np.ndarray, width: int, height: int, pad_ratio: float = 0.45) -> EyeBox:
     x, y, w, h = cv2.boundingRect(points)
     pad_x = int(w * pad_ratio)
     pad_y = int(h * pad_ratio)
@@ -100,42 +93,89 @@ def _iris_center(landmarks, iris_indices: Iterable[int], width: int, height: int
     return int(center[0]), int(center[1])
 
 
-def _soft_mask(shape: Tuple[int, int], feather: int = 12) -> np.ndarray:
+def _soft_ellipse_mask(shape: Tuple[int, int], center: Tuple[float, float], axes: Tuple[float, float]) -> np.ndarray:
     h, w = shape
     mask = np.zeros((h, w), dtype=np.float32)
-    cv2.ellipse(mask, (w // 2, h // 2), (max(1, w // 2), max(1, h // 2)), 0, 0, 360, 1.0, -1)
-    k = max(3, feather | 1)
-    mask = cv2.GaussianBlur(mask, (k, k), 0)
-    return mask[..., None]
+    cx, cy = center
+    ax, ay = axes
+    cv2.ellipse(
+        mask,
+        (int(round(cx)), int(round(cy))),
+        (max(1, int(round(ax))), max(1, int(round(ay)))),
+        0,
+        0,
+        360,
+        1.0,
+        -1,
+    )
+    feather = max(5, int(min(ax, ay) * 0.9)) | 1
+    return cv2.GaussianBlur(mask, (feather, feather), 0)[..., None]
 
 
-def _redirect_eye(frame: np.ndarray, box: EyeBox, iris_center: Optional[Tuple[int, int]], strength: float) -> None:
+def _eye_target(eye_points: np.ndarray) -> Tuple[float, float]:
+    # Use the median of the eye outline instead of the padded ROI center. This
+    # gives a more useful target for "look into the camera" correction.
+    return float(np.median(eye_points[:, 0])), float(np.median(eye_points[:, 1]))
+
+
+def _redirect_eye(
+    frame: np.ndarray,
+    box: EyeBox,
+    eye_points: np.ndarray,
+    iris_center: Optional[Tuple[int, int]],
+    strength: float,
+    debug: bool = False,
+) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
+    """Shift mostly the iris/pupil area toward the eye center.
+
+    The earlier version shifted the whole ROI, which was too subtle. This uses
+    an iris-centered elliptical mask, so the effect is visible while keeping the
+    eyelids and surrounding skin mostly stable.
+    """
     if not box.valid() or iris_center is None:
-        return
+        return None
 
     roi = frame[box.y1:box.y2, box.x1:box.x2]
     if roi.size == 0:
-        return
+        return None
 
     h, w = roi.shape[:2]
-    local_iris_x = iris_center[0] - box.x1
-    local_iris_y = iris_center[1] - box.y1
+    local_iris_x = float(iris_center[0] - box.x1)
+    local_iris_y = float(iris_center[1] - box.y1)
 
-    target_x = w * 0.5
-    target_y = h * 0.5
+    target_x, target_y = _eye_target(eye_points)
+    local_target_x = target_x - box.x1
+    local_target_y = target_y - box.y1
 
-    dx = (target_x - local_iris_x) * strength
-    dy = (target_y - local_iris_y) * strength * 0.35
+    dx = (local_target_x - local_iris_x) * strength
+    dy = (local_target_y - local_iris_y) * strength
 
-    dx = float(np.clip(dx, -w * 0.10, w * 0.10))
-    dy = float(np.clip(dy, -h * 0.06, h * 0.06))
+    # Strong enough to see, but clamped to avoid monster-eye artifacts.
+    dx = float(np.clip(dx, -w * 0.22, w * 0.22))
+    dy = float(np.clip(dy, -h * 0.16, h * 0.16))
 
+    if abs(dx) < 0.4 and abs(dy) < 0.4:
+        return ((int(local_iris_x + box.x1), int(local_iris_y + box.y1)), (int(local_target_x + box.x1), int(local_target_y + box.y1)))
+
+    shifted = np.zeros_like(roi)
     matrix = np.float32([[1, 0, dx], [0, 1, dy]])
     shifted = cv2.warpAffine(roi, matrix, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
-    mask = _soft_mask((h, w), feather=max(7, min(w, h) // 3))
+    eye_w = max(8.0, float(cv2.boundingRect(eye_points)[2]))
+    eye_h = max(5.0, float(cv2.boundingRect(eye_points)[3]))
+    mask = _soft_ellipse_mask(
+        (h, w),
+        center=(local_iris_x + dx * 0.15, local_iris_y + dy * 0.15),
+        axes=(eye_w * 0.34, eye_h * 0.95),
+    )
+
     blended = (shifted.astype(np.float32) * mask + roi.astype(np.float32) * (1.0 - mask)).astype(np.uint8)
     frame[box.y1:box.y2, box.x1:box.x2] = blended
+
+    return (
+        (int(local_iris_x + box.x1), int(local_iris_y + box.y1)),
+        (int(local_iris_x + dx + box.x1), int(local_iris_y + dy + box.y1)),
+    )
 
 
 def _draw_debug(frame: np.ndarray, landmarks, width: int, height: int) -> None:
@@ -237,6 +277,7 @@ def run(args: argparse.Namespace) -> None:
             height, width = frame.shape[:2]
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             landmarks = provider.process(rgb)
+            correction_vectors = []
 
             if landmarks:
                 left_eye_points = _points_from_landmarks(landmarks, LEFT_EYE_OUTLINE, width, height)
@@ -246,13 +287,16 @@ def run(args: argparse.Namespace) -> None:
                 left_iris = _iris_center(landmarks, LEFT_IRIS, width, height)
                 right_iris = _iris_center(landmarks, RIGHT_IRIS, width, height)
 
-                _redirect_eye(frame, left_box, left_iris, strength)
-                _redirect_eye(frame, right_box, right_iris, strength)
+                left_vec = _redirect_eye(frame, left_box, left_eye_points, left_iris, strength, debug)
+                right_vec = _redirect_eye(frame, right_box, right_eye_points, right_iris, strength, debug)
+                correction_vectors = [v for v in (left_vec, right_vec) if v is not None]
 
                 if debug:
                     _draw_debug(frame, landmarks, width, height)
                     cv2.rectangle(frame, (left_box.x1, left_box.y1), (left_box.x2, left_box.y2), (255, 255, 255), 1)
                     cv2.rectangle(frame, (right_box.x1, right_box.y1), (right_box.x2, right_box.y2), (255, 255, 255), 1)
+                    for start, end in correction_vectors:
+                        cv2.arrowedLine(frame, start, end, (0, 0, 255), 2, tipLength=0.35)
 
             fps_count += 1
             elapsed = time.time() - fps_time
@@ -295,9 +339,9 @@ def run(args: argparse.Namespace) -> None:
                     virtual_cam.close()
                     virtual_cam = None
             if key in (ord("+"), ord("=")):
-                strength = min(1.0, strength + 0.05)
+                strength = min(1.5, strength + 0.10)
             if key in (ord("-"), ord("_")):
-                strength = max(0.0, strength - 0.05)
+                strength = max(0.0, strength - 0.10)
     finally:
         if virtual_cam is not None:
             virtual_cam.close()
@@ -312,8 +356,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1280, help="capture width")
     parser.add_argument("--height", type=int, default=720, help="capture height")
     parser.add_argument("--fps", type=int, default=30, help="target FPS")
-    parser.add_argument("--strength", type=float, default=0.35, help="correction strength from 0.0 to 1.0")
-    parser.add_argument("--debug", action="store_true", help="show landmarks and eye boxes")
+    parser.add_argument("--strength", type=float, default=0.8, help="correction strength from 0.0 to 1.5")
+    parser.add_argument("--debug", action="store_true", help="show landmarks, boxes, and red correction arrows")
     parser.add_argument("--virtual-camera", action="store_true", help="send frames to pyvirtualcam when available")
     parser.add_argument("--landmarker-model", default=DEFAULT_MODEL_PATH, help="path to face_landmarker.task")
     return parser.parse_args()
